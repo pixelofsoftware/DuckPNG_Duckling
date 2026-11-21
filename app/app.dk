@@ -1,0 +1,273 @@
+#{
+    Praktyczne zastosowanie wrappera: narzędzie do grafik gry (duszki, kafelki, tła).
+
+    Program czyta ze standardowego wejścia trzy wiersze:
+      1. polecenie:
+         info          - wymiary, format pliku, statystyka przezroczystości i średni kolor;
+         klucz RRGGBB  - piksele w kolorze tła (np. FF00FF) stają się przezroczyste;
+         szarosc       - odcienie szarości (jasność 0,299 R + 0,587 G + 0,114 B), alpha bez zmian;
+         pomniejsz     - zmniejszenie 2 razy (średnia 2x2 ważona przezroczystością);
+      2. plik wejściowy PNG (dowolny typ: paleta, szarość, RGB, 16 bitów, przeplot);
+      3. plik wyjściowy PNG (dla info pomijany).
+    Po zapisie program wczytuje plik wynikowy i porównuje go bajt po bajcie z obrazem w pamięci.
+    Kod zakończenia: 0 - sukces, 2 - złe parametry, 3 - brak pliku, 4 - niepoprawny lub
+    za duży PNG, 5 - błąd zapisu albo niezgodność przy sprawdzeniu.
+#}
+import core.containers.*;
+import core.primitive_io as io;
+import png;
+
+class Wiersz {
+    tekst: String;
+    jest: bool = false;
+}
+
+fun czytajWiersz() -> Wiersz = {
+    var w: Wiersz;
+    var znak = io.readCharCode();
+    if (znak < 0) return w;
+    w.jest = true;
+    while (znak >= 0 and znak != '\n' as i32) {
+        if (znak != '\r' as i32) w.tekst.append(znak as char);
+        znak = io.readCharCode();
+    }
+    return w;
+}
+
+fun rowne(a: str, b: str) -> bool = {
+    if (a.length() != b.length()) return false;
+    var i: i64 = 0;
+    while (i < a.length()) {
+        if (a[i] != b[i]) return false;
+        i += 1;
+    }
+    return true;
+}
+
+fun zaczynaSie(a: str, b: str) -> bool = {
+    if (a.length() < b.length()) return false;
+    var i: i64 = 0;
+    while (i < b.length()) {
+        if (a[i] != b[i]) return false;
+        i += 1;
+    }
+    return true;
+}
+
+fun identyczne(a: ref List[u8], b: ref List[u8]) -> bool = {
+    if (a.length() != b.length()) return false;
+    var i: i64 = 0;
+    while (i < a.length()) {
+        if (a.at(i) != b.at(i)) return false;
+        i += 1;
+    }
+    return true;
+}
+
+fun cyfraHex(c: char) -> i64 = {
+    let k = c as i64;
+    if (k >= 48 and k <= 57) return k - 48;
+    if (k >= 65 and k <= 70) return k - 55;
+    if (k >= 97 and k <= 102) return k - 87;
+    return -1;
+}
+
+# Kolor RRGGBB z polecenia "klucz RRGGBB" jako 0xRRGGBB albo -1.
+fun kolorKlucza(polecenie: str) -> i64 = {
+    if (polecenie.length() != 12) return -1;
+    var w: i64 = 0;
+    var i: i64 = 6;
+    while (i < 12) {
+        let c = cyfraHex(polecenie[i]);
+        if (c < 0) return -1;
+        w = w * 16 + c;
+        i += 1;
+    }
+    return w;
+}
+
+fun info(o: ref png.Obraz, formatPliku: i64) -> () = {
+    var przezroczyste: i64 = 0;
+    var czesciowo: i64 = 0;
+    var sumaR: i64 = 0;
+    var sumaG: i64 = 0;
+    var sumaB: i64 = 0;
+    var sumaA: i64 = 0;
+    var y: i64 = 0;
+    while (y < o.wysokosc) {
+        var x: i64 = 0;
+        while (x < o.szerokosc) {
+            let k = png.piksel(o, x, y);
+            if (k.a == 0) przezroczyste += 1;
+            if (k.a > 0 and k.a < 255) czesciowo += 1;
+            sumaR += k.r * k.a;
+            sumaG += k.g * k.a;
+            sumaB += k.b * k.a;
+            sumaA += k.a;
+            x += 1;
+        }
+        y += 1;
+    }
+    let wszystkie = o.szerokosc * o.wysokosc;
+    let format = png.opisFormatu(formatPliku);
+    print(f"Wymiary: {o.szerokosc}x{o.wysokosc} ({wszystkie} pikseli, {o.piksele.length()} bajtow RGBA8)\n");
+    print(f"Format pliku: {format.asSlice()}\n");
+    print(f"Piksele: nieprzezroczyste {wszystkie - przezroczyste - czesciowo}, polprzezroczyste {czesciowo}, przezroczyste {przezroczyste}\n");
+    if (sumaA > 0) {
+        print(f"Sredni kolor widocznych pikseli (wazony alpha): ({(sumaR + sumaA / 2) / sumaA}, {(sumaG + sumaA / 2) / sumaA}, {(sumaB + sumaA / 2) / sumaA})\n");
+    } else {
+        print("Obraz jest calkowicie przezroczysty.\n");
+    }
+}
+
+fun klucz(o: ref png.Obraz, kolor: i64) -> i64 = {
+    let r = (kolor >> 16) & 255;
+    let g = (kolor >> 8) & 255;
+    let b = kolor & 255;
+    var zmienione: i64 = 0;
+    var y: i64 = 0;
+    while (y < o.wysokosc) {
+        var x: i64 = 0;
+        while (x < o.szerokosc) {
+            let k = png.piksel(o, x, y);
+            if (k.r == r and k.g == g and k.b == b and k.a != 0) {
+                png.ustawPiksel(o, x, y, k.r, k.g, k.b, 0);
+                zmienione += 1;
+            }
+            x += 1;
+        }
+        y += 1;
+    }
+    return zmienione;
+}
+
+fun szarosc(o: ref png.Obraz) -> () = {
+    var y: i64 = 0;
+    while (y < o.wysokosc) {
+        var x: i64 = 0;
+        while (x < o.szerokosc) {
+            let k = png.piksel(o, x, y);
+            let j = (299 * k.r + 587 * k.g + 114 * k.b + 500) / 1000;
+            png.ustawPiksel(o, x, y, j, j, j, k.a);
+            x += 1;
+        }
+        y += 1;
+    }
+}
+
+# Zmniejszenie 2 razy: kolor ważony przezroczystością, żeby przezroczyste tło nie
+# przyciemniało krawędzi; alpha to zwykła średnia. Nieparzysty wymiar: ostatni blok węższy.
+fun pomniejsz(o: ref png.Obraz) -> png.Wynik = {
+    let szer = (o.szerokosc + 1) / 2;
+    let wys = (o.wysokosc + 1) / 2;
+    var wynik = png.nowyObraz(szer, wys, 0, 0, 0, 0);
+    if (not wynik.ok) return wynik;
+    var y: i64 = 0;
+    while (y < wys) {
+        var x: i64 = 0;
+        while (x < szer) {
+            var n: i64 = 0;
+            var sr: i64 = 0;
+            var sg: i64 = 0;
+            var sb: i64 = 0;
+            var sa: i64 = 0;
+            var dy: i64 = 0;
+            while (dy < 2) {
+                var dx: i64 = 0;
+                while (dx < 2) {
+                    let px = 2 * x + dx;
+                    let py = 2 * y + dy;
+                    if (px < o.szerokosc and py < o.wysokosc) {
+                        let k = png.piksel(o, px, py);
+                        n += 1;
+                        sr += k.r * k.a;
+                        sg += k.g * k.a;
+                        sb += k.b * k.a;
+                        sa += k.a;
+                    }
+                    dx += 1;
+                }
+                dy += 1;
+            }
+            if (sa > 0) {
+                png.ustawPiksel(&wynik.obraz, x, y, (sr + sa / 2) / sa, (sg + sa / 2) / sa, (sb + sa / 2) / sa, (sa + n / 2) / n);
+            }
+            x += 1;
+        }
+        y += 1;
+    }
+    return wynik;
+}
+
+fun kodBledu(w: ref png.Wynik) -> i64 = {
+    if (w.rodzaj == png.BRAK_PLIKU) return 3;
+    if (w.rodzaj == png.NIEPOPRAWNY_PNG or w.rodzaj == png.ZA_DUZY) return 4;
+    if (w.rodzaj == png.BLAD_ZAPISU) return 5;
+    return 2;
+}
+
+fun main() -> i64 = {
+    let wersja = png.wersjaBiblioteki();
+    print(f"Narzedzie do grafik gry (wrapper libpng {wersja.asSlice()}). Podaj: polecenie (info, klucz RRGGBB, szarosc, pomniejsz), plik wejsciowy, plik wyjsciowy.\n");
+    let polecenie = czytajWiersz();
+    let wejscie = czytajWiersz();
+    let wyjscie = czytajWiersz();
+    if (not polecenie.jest or not wejscie.jest or wejscie.tekst.length() == 0) {
+        print("Blad: podaj polecenie i plik wejsciowy w osobnych wierszach.\n");
+        return 2;
+    }
+    let p = polecenie.tekst.asSlice();
+    let jestInfo = rowne(p, "info");
+    let jestKlucz = zaczynaSie(p, "klucz ");
+    let kolor = kolorKlucza(p);
+    if (jestKlucz and kolor < 0) {
+        print(f"Blad: '{p}' - podaj kolor jako 6 cyfr szesnastkowych, np. klucz FF00FF.\n");
+        return 2;
+    }
+    if (not jestInfo and not jestKlucz and not rowne(p, "szarosc") and not rowne(p, "pomniejsz")) {
+        print(f"Blad: nieznane polecenie '{p}' (info, klucz RRGGBB, szarosc, pomniejsz).\n");
+        return 2;
+    }
+    if (not jestInfo and (not wyjscie.jest or wyjscie.tekst.length() == 0 or rowne(wyjscie.tekst.asSlice(), wejscie.tekst.asSlice()))) {
+        print("Blad: podaj plik wyjsciowy inny niz wejsciowy.\n");
+        return 2;
+    }
+    var odczyt = png.wczytaj(wejscie.tekst.asSlice());
+    if (not odczyt.ok) {
+        print(f"Blad ({png.nazwaRodzaju(odczyt.rodzaj)}): {odczyt.blad.asSlice()}\n");
+        return kodBledu(&odczyt);
+    }
+    if (jestInfo) {
+        info(&odczyt.obraz, odczyt.formatPliku);
+        return 0;
+    }
+    var wynik: png.Obraz;
+    if (jestKlucz) {
+        let zmienione = klucz(&odczyt.obraz, kolor);
+        print(f"Klucz koloru: {zmienione} z {odczyt.obraz.szerokosc * odczyt.obraz.wysokosc} pikseli stalo sie przezroczystych.\n");
+        wynik = copy odczyt.obraz;
+    } else if (rowne(p, "szarosc")) {
+        szarosc(&odczyt.obraz);
+        wynik = copy odczyt.obraz;
+    } else {
+        var mniejszy = pomniejsz(&odczyt.obraz);
+        if (not mniejszy.ok) {
+            print(f"Blad: {mniejszy.blad.asSlice()}\n");
+            return 2;
+        }
+        print(f"Pomniejszono {odczyt.obraz.szerokosc}x{odczyt.obraz.wysokosc} -> {mniejszy.obraz.szerokosc}x{mniejszy.obraz.wysokosc}.\n");
+        wynik = copy mniejszy.obraz;
+    }
+    var zapis = png.zapisz(wyjscie.tekst.asSlice(), &wynik);
+    if (not zapis.ok) {
+        print(f"Blad ({png.nazwaRodzaju(zapis.rodzaj)}): {zapis.blad.asSlice()}\n");
+        return kodBledu(&zapis);
+    }
+    let sprawdzenie = png.wczytaj(wyjscie.tekst.asSlice());
+    if (not sprawdzenie.ok or sprawdzenie.obraz.szerokosc != wynik.szerokosc or not identyczne(&sprawdzenie.obraz.piksele, &wynik.piksele)) {
+        print("Blad: sprawdzenie nie powiodlo sie - zapisany plik rozni sie od obrazu w pamieci.\n");
+        return 5;
+    }
+    print(f"Zapisano {wyjscie.tekst.asSlice()} ({wynik.szerokosc}x{wynik.wysokosc} RGBA8); sprawdzenie: plik wczytuje sie do identycznych {wynik.piksele.length()} bajtow.\n");
+    return 0;
+}

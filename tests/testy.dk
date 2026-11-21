@@ -1,0 +1,211 @@
+# Testy wrappera libpng: build.py podstawia ten plik w miejsce app/app.dk.
+# Uruchamiane w katalogu budowy: build.py kopiuje tam katalog dane/ z plikami testowymi,
+# a pliki zapisywane przez testy (test-*.png) powstają obok.
+# Każde sprawdzenie wypisuje PASS albo FAIL; kod zakończenia to liczba błędów.
+import core.containers.*;
+import png;
+
+fun sprawdz(warunek: bool, nazwa: str) -> i64 = {
+    if (warunek) {
+        print(f"PASS {nazwa}\n");
+        return 0;
+    }
+    print(f"FAIL {nazwa}\n");
+    return 1;
+}
+
+fun identyczne(a: ref List[u8], b: ref List[u8]) -> bool = {
+    if (a.length() != b.length()) return false;
+    var i: i64 = 0;
+    while (i < a.length()) {
+        if (a.at(i) != b.at(i)) return false;
+        i += 1;
+    }
+    return true;
+}
+
+fun blisko(a: i64, b: i64, tolerancja: i64) -> bool = a - b <= tolerancja and b - a <= tolerancja;
+
+fun kolorJak(o: ref png.Obraz, x: i64, y: i64, r: i64, g: i64, b: i64, a: i64, tolerancja: i64) -> bool = {
+    let k = png.piksel(o, x, y);
+    return blisko(k.r, r, tolerancja) and blisko(k.g, g, tolerancja) and blisko(k.b, b, tolerancja) and blisko(k.a, a, tolerancja);
+}
+
+fun zawiera(tekst: str, fragment: str) -> bool = {
+    var i: i64 = 0;
+    while (i + fragment.length() <= tekst.length()) {
+        var j: i64 = 0;
+        var zgodne = true;
+        while (zgodne and j < fragment.length()) {
+            if (tekst[i + j] != fragment[j]) zgodne = false;
+            j += 1;
+        }
+        if (zgodne) return true;
+        i += 1;
+    }
+    return false;
+}
+
+# Pseudolosowe bajty (xorshift64*): obraz z każdą możliwą wartością kanałów, także alpha.
+fun losowyObraz(szerokosc: i64, wysokosc: i64, ziarno: u64) -> png.Obraz = {
+    var o: png.Obraz;
+    o.szerokosc = szerokosc;
+    o.wysokosc = wysokosc;
+    var s = ziarno;
+    var i: i64 = 0;
+    while (i < szerokosc * wysokosc * 4) {
+        s = s ^ (s >> 12u64);
+        s = s ^ (s << 25u64);
+        s = s ^ (s >> 27u64);
+        let x = s * 2685821657736338717u64;
+        o.piksele.push((x >> 56u64) as u8);
+        i += 1;
+    }
+    return o;
+}
+
+fun testyRozmiaru() -> i64 = {
+    var b: i64 = 0;
+    let wersja = png.wersjaBiblioteki();
+    print(f"  (biblioteka: libpng {wersja.asSlice()})\n");
+    b += sprawdz(zawiera(wersja.asSlice(), "1.6."), "wersja biblioteki 1.6.x");
+    b += sprawdz(png.sprawdzRozmiar(4, 3, png.DOMYSLNY_LIMIT) == 48, "rozmiar 4x3 RGBA8 = 48 bajtow");
+    b += sprawdz(png.sprawdzRozmiar(0, 5, png.DOMYSLNY_LIMIT) == png.ROZMIAR_ZLE_WYMIARY and png.sprawdzRozmiar(5, -1, png.DOMYSLNY_LIMIT) == png.ROZMIAR_ZLE_WYMIARY, "wymiary 0 i ujemne odrzucone");
+    b += sprawdz(png.sprawdzRozmiar(536870911, 1, png.MAKS_I64) == 2147483644 and png.sprawdzRozmiar(536870912, 1, png.MAKS_I64) == png.ROZMIAR_POZA_ZAKRESEM, "krok wiersza: 536870911*4 miesci sie w png_int_32, 536870912*4 juz nie");
+    b += sprawdz(png.sprawdzRozmiar(500000000, 4611686018427387904, png.MAKS_I64) == png.ROZMIAR_POZA_ZAKRESEM, "iloczyn 500000000*4*2^62 wykryty przed mnozeniem (przekroczylby i64)");
+    b += sprawdz(png.sprawdzRozmiar(1, 2147483648, png.MAKS_I64) == png.ROZMIAR_POZA_ZAKRESEM, "wysokosc 2^31 poza zakresem PNG");
+    b += sprawdz(png.sprawdzRozmiar(8192, 8192, png.DOMYSLNY_LIMIT) == 268435456 and png.sprawdzRozmiar(8192, 8193, png.DOMYSLNY_LIMIT) == png.ROZMIAR_PONAD_LIMIT, "limit 256 MiB: 8192x8192 tak, 8192x8193 nie");
+    let zero = png.nowyObraz(0, 5, 0, 0, 0, 0);
+    let wielki = png.nowyObraz(100000, 100000, 0, 0, 0, 0);
+    let zlyKolor = png.nowyObraz(2, 2, 256, 0, 0, 0);
+    b += sprawdz(zero.rodzaj == png.BLEDNE_PARAMETRY and wielki.rodzaj == png.ZA_DUZY and zlyKolor.rodzaj == png.BLEDNE_PARAMETRY and wielki.obraz.piksele.length() == 0, "nowyObraz: zle wymiary, za duzy, skladowa 256 - bez przydzialu");
+    return b;
+}
+
+fun testyObiegu() -> i64 = {
+    var b: i64 = 0;
+    var nowy = png.nowyObraz(4, 3, 10, 20, 30, 255);
+    var o = copy nowy.obraz;
+    # Kolory i przezroczystość: także alpha 0 z niezerowym kolorem i wartości graniczne.
+    png.ustawPiksel(&o, 0, 0, 255, 0, 0, 255);
+    png.ustawPiksel(&o, 1, 0, 0, 255, 0, 128);
+    png.ustawPiksel(&o, 2, 0, 0, 0, 255, 1);
+    png.ustawPiksel(&o, 3, 0, 200, 100, 50, 0);
+    png.ustawPiksel(&o, 0, 2, 255, 255, 255, 254);
+    png.ustawPiksel(&o, 3, 2, 0, 0, 0, 0);
+    b += sprawdz(nowy.ok and png.poprawny(&o) and o.piksele.length() == 48, "nowy obraz 4x3 ma 48 bajtow");
+    b += sprawdz(kolorJak(&o, 1, 0, 0, 255, 0, 128, 0) and kolorJak(&o, 1, 1, 10, 20, 30, 255, 0), "piksel(x, y) czyta R, G, B, A z bajtu (y*szer+x)*4");
+    let zapis = png.zapisz("test-obieg.png", &o);
+    b += sprawdz(zapis.ok and zapis.rodzaj == png.OK, "zapis obrazu RGBA8 do PNG");
+    let odczyt = png.wczytaj("test-obieg.png");
+    b += sprawdz(odczyt.ok and odczyt.obraz.szerokosc == 4 and odczyt.obraz.wysokosc == 3 and odczyt.formatPliku == 3, "ponowny odczyt: wymiary 4x3, plik w formacie kolor + alpha");
+    b += sprawdz(identyczne(&odczyt.obraz.piksele, &o.piksele), "ponowny odczyt: wszystkie bajty identyczne");
+    b += sprawdz(kolorJak(&odczyt.obraz, 3, 0, 200, 100, 50, 0, 0) and kolorJak(&odczyt.obraz, 2, 0, 0, 0, 255, 1, 0), "alpha 0 i 1 zachowuja pelny kolor (alpha nieprzemnozona)");
+
+    var losowy = losowyObraz(37, 23, 88172645463325252u64);
+    let zapisLosowego = png.zapisz("test-losowy.png", &losowy);
+    let odczytLosowego = png.wczytaj("test-losowy.png");
+    b += sprawdz(zapisLosowego.ok and odczytLosowego.ok and identyczne(&odczytLosowego.obraz.piksele, &losowy.piksele), "obieg 37x23 z losowymi kanalami (wszystkie wartosci alpha) bez strat");
+
+    var maly = png.nowyObraz(1, 1, 1, 2, 3, 4);
+    let zapisMalego = png.zapisz("test-obieg.png", &maly.obraz);
+    let odczytMalego = png.wczytaj("test-obieg.png");
+    b += sprawdz(zapisMalego.ok and odczytMalego.ok and odczytMalego.obraz.szerokosc == 1 and kolorJak(&odczytMalego.obraz, 0, 0, 1, 2, 3, 4, 0), "zapis zastepuje istniejacy plik; obraz 1x1");
+
+    b += sprawdz(png.piksel(&o, 4, 0).a == 0 and png.piksel(&o, -1, 0).r == 0 and not png.ustawPiksel(&o, 0, 3, 1, 1, 1, 1) and not png.ustawPiksel(&o, 0, 0, 300, 0, 0, 0), "piksele poza obrazem i skladowe poza 0..255 odrzucone");
+    return b;
+}
+
+fun testyKonwersji() -> i64 = {
+    var b: i64 = 0;
+    let paleta = png.wczytaj("dane/paleta.png");
+    b += sprawdz(paleta.ok and (paleta.formatPliku & png.FORMAT_PALETA) != 0 and paleta.obraz.szerokosc == 4 and paleta.obraz.wysokosc == 2, "paleta z tRNS wczytana jako RGBA 4x2");
+    b += sprawdz(kolorJak(&paleta.obraz, 0, 0, 255, 0, 0, 255, 0) and kolorJak(&paleta.obraz, 1, 0, 0, 255, 0, 128, 0) and kolorJak(&paleta.obraz, 2, 0, 0, 0, 255, 0, 0) and kolorJak(&paleta.obraz, 3, 0, 255, 255, 255, 255, 0) and kolorJak(&paleta.obraz, 0, 1, 255, 255, 255, 255, 0), "paleta: kolory i alpha z tRNS (255, 128, 0, domyslnie 255)");
+    let szarosc = png.wczytaj("dane/szarosc_alpha.png");
+    b += sprawdz(szarosc.ok and szarosc.formatPliku == png.FORMAT_ALPHA and kolorJak(&szarosc.obraz, 0, 0, 0, 0, 0, 255, 1) and kolorJak(&szarosc.obraz, 1, 0, 128, 128, 128, 128, 1) and kolorJak(&szarosc.obraz, 2, 0, 255, 255, 255, 0, 1), "szarosc + alpha: R = G = B = szarosc, alpha zachowana");
+    let rgb16 = png.wczytaj("dane/rgb16.png");
+    b += sprawdz(rgb16.ok and rgb16.formatPliku == (png.FORMAT_KOLOR | png.FORMAT_16_BITOW) and kolorJak(&rgb16.obraz, 0, 0, 0, 0, 0, 255, 1) and kolorJak(&rgb16.obraz, 1, 0, 255, 128, 64, 255, 1) and kolorJak(&rgb16.obraz, 2, 0, 200, 255, 0, 255, 1), "RGB 16 bitow -> 8 bitow (v*255/65535), brak alpha = 255");
+    let przeplot = png.wczytaj("dane/przeplot.png");
+    var zgodne = przeplot.ok and przeplot.obraz.szerokosc == 5;
+    var y: i64 = 0;
+    while (zgodne and y < 5) {
+        var x: i64 = 0;
+        while (x < 5) {
+            if (not kolorJak(&przeplot.obraz, x, y, 50 * x, 50 * y, 20 * (x + y), 255 - 10 * x, 0)) zgodne = false;
+            x += 1;
+        }
+        y += 1;
+    }
+    b += sprawdz(zgodne, "przeplot Adam7 5x5: wszystkie 25 pikseli zgodne");
+    let duszek = png.wczytaj("dane/duszek.png");
+    b += sprawdz(duszek.ok and duszek.formatPliku == png.FORMAT_KOLOR and kolorJak(&duszek.obraz, 0, 0, 255, 0, 255, 255, 0) and kolorJak(&duszek.obraz, 6, 1, 250, 210, 40, 255, 0), "RGB bez alpha: alpha = 255");
+    return b;
+}
+
+fun testyBledow() -> i64 = {
+    var b: i64 = 0;
+    let brak = png.wczytaj("dane/nie_ma_takiego.png");
+    print(f"  brak pliku: {brak.blad.asSlice()}\n");
+    b += sprawdz(not brak.ok and brak.rodzaj == png.BRAK_PLIKU and zawiera(brak.blad.asSlice(), "nie_ma_takiego.png: ") and brak.blad.length() > 28, "brakujacy plik: BRAK_PLIKU z komunikatem libpng");
+    let tekst = png.wczytaj("dane/nie_png.png");
+    print(f"  nie PNG: {tekst.blad.asSlice()}\n");
+    b += sprawdz(not tekst.ok and tekst.rodzaj == png.NIEPOPRAWNY_PNG and tekst.blad.length() > 20 and tekst.obraz.piksele.length() == 0, "plik tekstowy: NIEPOPRAWNY_PNG ze skopiowanym komunikatem");
+    let dane = png.wczytaj("dane/uszkodzony.png");
+    print(f"  uszkodzone dane: {dane.blad.asSlice()}\n");
+    b += sprawdz(not dane.ok and dane.rodzaj == png.NIEPOPRAWNY_PNG and zawiera(dane.blad.asSlice(), "IDAT"), "zepsute dane IDAT: NIEPOPRAWNY_PNG z komunikatem libpng");
+    let crc = png.wczytaj("dane/zle_crc.png");
+    print(f"  zla suma CRC: {crc.blad.asSlice()}\n");
+    b += sprawdz(not crc.ok and crc.rodzaj == png.NIEPOPRAWNY_PNG and zawiera(crc.blad.asSlice(), "CRC"), "zla suma CRC fragmentu IDAT: NIEPOPRAWNY_PNG");
+    let uciety = png.wczytaj("dane/uciety.png");
+    print(f"  uciety: {uciety.blad.asSlice()}\n");
+    b += sprawdz(not uciety.ok and uciety.rodzaj == png.NIEPOPRAWNY_PNG and uciety.formatPliku == 3, "uciety plik: naglowek przeczytany, dekodowanie przerwane bledem");
+    let bomba = png.wczytaj("dane/bomba.png");
+    print(f"  bomba: {bomba.blad.asSlice()}\n");
+    b += sprawdz(not bomba.ok and bomba.rodzaj == png.ZA_DUZY and bomba.formatPliku == 3 and bomba.obraz.piksele.length() == 0, "naglowek 100000x100000: odrzucony przed przydzialem 40 GB");
+    let ciasno = png.wczytajZLimitem("dane/krajobraz.png", 10239);
+    let dokladnie = png.wczytajZLimitem("dane/krajobraz.png", 10240);
+    b += sprawdz(ciasno.rodzaj == png.ZA_DUZY and dokladnie.ok and dokladnie.obraz.piksele.length() == 10240, "wlasny limit: 64x40x4 = 10240 bajtow, limit 10239 odrzucony");
+    b += sprawdz(png.wczytajZLimitem("dane/krajobraz.png", -1).rodzaj == png.BLEDNE_PARAMETRY, "ujemny limit odrzucony");
+
+    var zly: png.Obraz;
+    zly.szerokosc = 2;
+    zly.wysokosc = 2;
+    zly.piksele.push(1u8);
+    let zapisZlego = png.zapisz("test-zly-bufor.png", &zly);
+    print(f"  zly bufor: {zapisZlego.blad.asSlice()}\n");
+    b += sprawdz(zapisZlego.rodzaj == png.BLEDNE_PARAMETRY and png.wczytaj("test-zly-bufor.png").rodzaj == png.BRAK_PLIKU, "zapis: bufor 1 bajt dla 2x2 odrzucony, plik nie powstal");
+    var pusty: png.Obraz;
+    b += sprawdz(png.zapisz("test-pusty.png", &pusty).rodzaj == png.BLEDNE_PARAMETRY, "zapis obrazu 0x0 odrzucony");
+    var maly = png.nowyObraz(2, 2, 0, 0, 0, 255);
+    let bezKatalogu = png.zapisz("brak_katalogu/obraz.png", &maly.obraz);
+    print(f"  zapis bez katalogu: {bezKatalogu.blad.asSlice()}\n");
+    b += sprawdz(bezKatalogu.rodzaj == png.BLAD_ZAPISU and bezKatalogu.blad.length() > 40, "zapis do nieistniejacego katalogu: BLAD_ZAPISU z komunikatem libpng");
+    return b;
+}
+
+# Wiele cykli udanych i nieudanych operacji: zasoby libpng zwalniane na każdej ścieżce.
+fun testPetli() -> i64 = {
+    var udane: i64 = 0;
+    var i: i64 = 0;
+    var maly = png.nowyObraz(3, 2, 9, 8, 7, 6);
+    while (i < 500) {
+        if (png.wczytaj("dane/krajobraz.png").ok) udane += 1;
+        if (png.wczytaj("dane/nie_png.png").rodzaj == png.NIEPOPRAWNY_PNG) udane += 1;
+        if (png.wczytaj("dane/uszkodzony.png").rodzaj == png.NIEPOPRAWNY_PNG) udane += 1;
+        if (png.wczytaj("dane/bomba.png").rodzaj == png.ZA_DUZY) udane += 1;
+        if (png.zapisz("test-petla.png", &maly.obraz).ok) udane += 1;
+        i += 1;
+    }
+    return sprawdz(udane == 2500, "500 cykli: odczyt, 3 rodzaje bledow i zapis - wszystkie wyniki zgodne");
+}
+
+fun main() -> i64 = {
+    var bledy: i64 = 0;
+    bledy += testyRozmiaru();
+    bledy += testyObiegu();
+    bledy += testyKonwersji();
+    bledy += testyBledow();
+    bledy += testPetli();
+    print(f"Bledy: {bledy}\n");
+    return bledy;
+}

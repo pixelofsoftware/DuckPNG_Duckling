@@ -1,0 +1,86 @@
+#{
+    Przykład podstawowy: obraz RGBA8, zapis, ponowny odczyt, konwersja z palety i błędy.
+
+    1. Tworzy obraz 3x2 z kolorami i przezroczystością, zapisuje go do przyklad.png,
+       wczytuje ponownie i porównuje bajt po bajcie.
+    2. Wczytuje plik z paletą i przezroczystością (dane/paleta.png) do RGBA8.
+    3. Pokazuje sprawdzenie rozmiaru przed przydziałem pamięci.
+    4. Kontrolowane błędy: brakujący plik, plik, który nie jest PNG, i nagłówek 100000x100000.
+    Uruchamiany w katalogu budowy (build.py kopiuje tam dane/).
+    Kod zakończenia: liczba niezgodności (0 = wszystko jak oczekiwano).
+#}
+import core.containers.*;
+import png;
+
+fun wypiszPiksele(o: ref png.Obraz) -> () = {
+    var y: i64 = 0;
+    while (y < o.wysokosc) {
+        print("   ");
+        var x: i64 = 0;
+        while (x < o.szerokosc) {
+            let k = png.piksel(o, x, y);
+            print(f" ({k.r},{k.g},{k.b},{k.a})");
+            x += 1;
+        }
+        print("\n");
+        y += 1;
+    }
+}
+
+fun identyczne(a: ref List[u8], b: ref List[u8]) -> bool = {
+    if (a.length() != b.length()) return false;
+    var i: i64 = 0;
+    while (i < a.length()) {
+        if (a.at(i) != b.at(i)) return false;
+        i += 1;
+    }
+    return true;
+}
+
+fun main() -> i64 = {
+    var bledy: i64 = 0;
+    let wersja = png.wersjaBiblioteki();
+    print(f"libpng {wersja.asSlice()}\n");
+
+    # 1. Własny obraz: górny wiersz nieprzezroczysty, dolny z różną przezroczystością.
+    var nowy = png.nowyObraz(3, 2, 0, 0, 0, 255);
+    var o = copy nowy.obraz;
+    png.ustawPiksel(&o, 0, 0, 255, 0, 0, 255);
+    png.ustawPiksel(&o, 1, 0, 0, 255, 0, 255);
+    png.ustawPiksel(&o, 2, 0, 0, 0, 255, 255);
+    png.ustawPiksel(&o, 0, 1, 255, 255, 255, 128);
+    png.ustawPiksel(&o, 1, 1, 255, 0, 255, 0);
+    print(f"Obraz {o.szerokosc}x{o.wysokosc} RGBA8, {o.piksele.length()} bajtow (R,G,B,A wierszami od gory):\n");
+    wypiszPiksele(&o);
+    let zapis = png.zapisz("przyklad.png", &o);
+    print(f"Zapis przyklad.png: {png.nazwaRodzaju(zapis.rodzaj)}\n");
+    let odczyt = png.wczytaj("przyklad.png");
+    let zgodny = odczyt.ok and odczyt.obraz.szerokosc == 3 and odczyt.obraz.wysokosc == 2 and identyczne(&odczyt.obraz.piksele, &o.piksele);
+    let format = png.opisFormatu(odczyt.formatPliku);
+    print(f"Ponowny odczyt: {odczyt.obraz.szerokosc}x{odczyt.obraz.wysokosc}, format pliku: {format.asSlice()}, bajty identyczne: {zgodny}\n");
+    if (not zapis.ok or not zgodny) bledy += 1;
+
+    # 2. Paleta z tRNS -> RGBA8.
+    let paleta = png.wczytaj("dane/paleta.png");
+    let formatPalety = png.opisFormatu(paleta.formatPliku);
+    print(f"dane/paleta.png: {paleta.obraz.szerokosc}x{paleta.obraz.wysokosc}, format pliku: {formatPalety.asSlice()}, po wczytaniu RGBA8:\n");
+    wypiszPiksele(&paleta.obraz);
+    let drugi = png.piksel(&paleta.obraz, 1, 0);
+    if (not paleta.ok or drugi.g != 255 or drugi.a != 128) bledy += 1;
+
+    # 3. Rozmiar sprawdzany przed przydziałem pamięci.
+    print(f"sprawdzRozmiar 8192x8192: {png.sprawdzRozmiar(8192, 8192, png.DOMYSLNY_LIMIT)} bajtow; 8192x8193: {png.sprawdzRozmiar(8192, 8193, png.DOMYSLNY_LIMIT)} (ponad limit 256 MiB); 600000000x10: {png.sprawdzRozmiar(600000000, 10, png.MAKS_I64)} (poza zakresem liczb)\n");
+    if (png.sprawdzRozmiar(8192, 8193, png.DOMYSLNY_LIMIT) != png.ROZMIAR_PONAD_LIMIT) bledy += 1;
+
+    # 4. Błędy z kopią komunikatu libpng.
+    let brak = png.wczytaj("dane/brak.png");
+    print(f"Brakujacy plik: {png.nazwaRodzaju(brak.rodzaj)}: {brak.blad.asSlice()}\n");
+    let tekst = png.wczytaj("dane/nie_png.png");
+    print(f"Plik tekstowy: {png.nazwaRodzaju(tekst.rodzaj)}: {tekst.blad.asSlice()}\n");
+    let bomba = png.wczytaj("dane/bomba.png");
+    print(f"Naglowek 100000x100000: {png.nazwaRodzaju(bomba.rodzaj)}: {bomba.blad.asSlice()}\n");
+    if (brak.rodzaj != png.BRAK_PLIKU or tekst.rodzaj != png.NIEPOPRAWNY_PNG or bomba.rodzaj != png.ZA_DUZY) bledy += 1;
+
+    print(f"Niezgodnosci: {bledy}\n");
+    return bledy;
+}

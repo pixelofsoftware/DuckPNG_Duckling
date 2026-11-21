@@ -1,0 +1,445 @@
+#{
+    png: wrapper uproszczonego API libpng (png_image) dla Ducklinga - wczytywanie plików PNG
+    do bufora RGBA8 i zapis obrazu RGBA8 do pliku PNG.
+
+    Publiczny typ Obraz ma jeden, stały układ pikseli:
+    * piksele wierszami od lewego górnego rogu, bez odstępów między wierszami
+      (krok wiersza = szerokosc * 4 bajty);
+    * każdy piksel to 4 bajty w kolejności R, G, B, A, po 8 bitów, wartości w sRGB;
+    * A to przezroczystość nieprzemnożona przez kolor: 0 - całkiem przezroczysty,
+      255 - nieprzezroczysty; R, G, B przechowują pełny kolor także przy A < 255;
+    * piksel (x, y) zaczyna się na bajcie (y * szerokosc + x) * 4.
+
+    Pamięć i zasoby: użytkownik dostaje KOPIĘ pikseli w List[u8]. Strukturę png_image,
+    bufor dla biblioteki i wewnętrzne zasoby libpng wrapper tworzy i zwalnia sam w każdej
+    funkcji, także przy błędzie (png_image_free, potem free). Komunikat błędu libpng jest
+    kopiowany do pola blad przed zwolnieniem struktury.
+
+    Przed przydziałem pamięci i przed wywołaniem biblioteki wrapper sprawdza, czy
+    szerokosc * wysokosc * 4 mieści się w zakresie liczb (krok wiersza w png_int_32, iloczyn
+    w i64) i w limicie pamięci (domyślnie 256 MiB).
+
+    Rodzaje błędów (pole rodzaj): BLEDNE_PARAMETRY, ZA_DUZY, BRAK_PLIKU, NIEPOPRAWNY_PNG,
+    BLAD_ZAPISU, BRAK_PAMIECI.
+#}
+import core.containers.*;
+import core.builtins as builtins;
+import core.clib as clib;
+
+#{
+    Deklaracje z png.h (libpng 1.6). Wskaźnik png_imagep przekazujemy jako cptr u8 do bloku
+    pamięci o układzie struct png_image; argumenty-wskaźniki, w które podajemy NULL
+    (tło, paleta), deklarujemy jako u64 i przekazujemy 0 - w ABI LP64 wskaźnik i u64
+    przekazuje się tak samo.
+#}
+extern("C") {
+    fundecl png_access_version_number() -> u32;
+    fundecl png_image_begin_read_from_file(obraz: cptr u8, sciezka: cptr char) -> i32;
+    fundecl png_image_finish_read(obraz: cptr u8, tlo: u64, bufor: cptr u8, krok: i32, paleta: u64) -> i32;
+    fundecl png_image_write_to_file(obraz: cptr u8, sciezka: cptr char, do8bitow: i32, bufor: cptr u8, krok: i32, paleta: u64) -> i32;
+    fundecl png_image_free(obraz: cptr u8) -> ();
+    fundecl fopen(sciezka: cptr char, tryb: cptr char) -> cptr u8;
+    fundecl fclose(plik: cptr u8) -> i32;
+}
+
+const OK: i32 = 0;
+const BLEDNE_PARAMETRY: i32 = 1;   # zły obraz albo wymiary podane przez wywołującego
+const ZA_DUZY: i32 = 2;            # przekroczony zakres liczb albo limit pamięci
+const BRAK_PLIKU: i32 = 3;         # pliku nie da się otworzyć do odczytu
+const NIEPOPRAWNY_PNG: i32 = 4;    # plik istnieje, ale libpng go odrzuciła
+const BLAD_ZAPISU: i32 = 5;        # libpng nie zapisała pliku
+const BRAK_PAMIECI: i32 = 6;
+
+const BAJTOW_NA_PIKSEL: i64 = 4;
+const DOMYSLNY_LIMIT: i64 = 268435456;          # 256 MiB pikseli (np. 8192 x 8192 RGBA8)
+const MAKS_INT: i64 = 2147483647;               # png_int_32 / png_uint_32 w PNG: najwyżej 2^31 - 1
+const MAKS_I64: i64 = 9223372036854775807;
+
+# Wyniki sprawdzRozmiar mniejsze od zera.
+const ROZMIAR_ZLE_WYMIARY: i64 = -1;     # szerokość lub wysokość <= 0
+const ROZMIAR_POZA_ZAKRESEM: i64 = -2;   # krok wiersza > 2^31-1, iloczyn > 2^63-1 albo wysokość > 2^31-1
+const ROZMIAR_PONAD_LIMIT: i64 = -3;     # liczba bajtów większa niż limit
+
+#{
+    Układ struct png_image z png.h 1.6.x w ABI LP64 (Linux x86_64, macOS arm64), sprawdzony
+    programem w C (sizeof, offsetof) z nagłówkiem libpng 1.6.50:
+      bajt  0  png_controlp opaque      (8 bajtów)
+      bajt  8  png_uint_32 version      bajt 12 width       bajt 16 height
+      bajt 20  png_uint_32 format       bajt 24 flags       bajt 28 colormap_entries
+      bajt 32  png_uint_32 warning_or_error
+      bajt 36  char message[64]
+      razem 104 bajty (z wyrównaniem do 8)
+    Pola liczbowe czytamy jako u32 o indeksie bajt / 4.
+#}
+const ROZMIAR_STRUKTURY: i64 = 104;
+const POLE_WERSJA: i64 = 2;
+const POLE_SZEROKOSC: i64 = 3;
+const POLE_WYSOKOSC: i64 = 4;
+const POLE_FORMAT: i64 = 5;
+const POLE_FLAGI: i64 = 6;
+const POLE_OSTRZEZENIE_BLAD: i64 = 8;
+const BAJT_KOMUNIKATU: i64 = 36;
+const DLUGOSC_KOMUNIKATU: i64 = 64;
+
+const PNG_IMAGE_VERSION: i64 = 1;
+const PNG_IMAGE_WARNING: i64 = 1;
+const PNG_IMAGE_FLAG_16BIT_sRGB: i64 = 4;
+const PNG_FORMAT_RGBA: i64 = 3;          # PNG_FORMAT_FLAG_COLOR | PNG_FORMAT_FLAG_ALPHA
+const FORMAT_ALPHA: i64 = 1;
+const FORMAT_KOLOR: i64 = 2;
+const FORMAT_16_BITOW: i64 = 4;          # PNG_FORMAT_FLAG_LINEAR: plik ma 16 bitów na składową
+const FORMAT_PALETA: i64 = 8;
+
+class Obraz {
+    szerokosc: i64 = 0;
+    wysokosc: i64 = 0;
+    piksele: List[u8];         # RGBA8, układ opisany na początku modułu
+}
+
+class Kolor {
+    r: i64 = 0;
+    g: i64 = 0;
+    b: i64 = 0;
+    a: i64 = 0;
+}
+
+class Wynik {
+    ok: bool = false;
+    rodzaj: i32 = OK;
+    obraz: Obraz;              # wczytany albo utworzony obraz (kopia należąca do wywołującego)
+    blad: String;              # opis błędu, z kopią komunikatu libpng
+    ostrzezenie: String;       # ostrzeżenie libpng przy udanej operacji (zwykle puste)
+    formatPliku: i64 = -1;     # format zapisany w pliku (flagi PNG_FORMAT_FLAG_*), -1 gdy nieznany
+}
+
+fun nazwaRodzaju(rodzaj: i32) -> str = {
+    if (rodzaj == OK) return "OK";
+    if (rodzaj == BLEDNE_PARAMETRY) return "BLEDNE_PARAMETRY";
+    if (rodzaj == ZA_DUZY) return "ZA_DUZY";
+    if (rodzaj == BRAK_PLIKU) return "BRAK_PLIKU";
+    if (rodzaj == NIEPOPRAWNY_PNG) return "NIEPOPRAWNY_PNG";
+    if (rodzaj == BLAD_ZAPISU) return "BLAD_ZAPISU";
+    return "BRAK_PAMIECI";
+}
+
+fun blad(rodzaj: i32, opis: str) -> Wynik = {
+    var w: Wynik;
+    w.rodzaj = rodzaj;
+    w.blad.append(opis);
+    return w;
+}
+
+# Wersja biblioteki, np. "1.6.50" (z png_access_version_number, np. 10650).
+fun wersjaBiblioteki() -> String = {
+    let n = png_access_version_number() as i64;
+    var w: String;
+    w.append((n / 10000).toString());
+    w.append('.');
+    w.append(((n / 100) % 100).toString());
+    w.append('.');
+    w.append((n % 100).toString());
+    return w;
+}
+
+# Opis formatu zapisanego w pliku, np. "kolor + alpha", "paleta", "szarosc, 16 bitow".
+fun opisFormatu(format: i64) -> String = {
+    var w: String;
+    if (format < 0) {
+        w.append("nieznany");
+        return w;
+    }
+    if ((format & FORMAT_PALETA) != 0) {
+        w.append("paleta");
+    } else if ((format & FORMAT_KOLOR) != 0) {
+        w.append("kolor");
+    } else {
+        w.append("szarosc");
+    }
+    if ((format & FORMAT_ALPHA) != 0) w.append(" + alpha");
+    if ((format & FORMAT_16_BITOW) != 0) w.append(", 16 bitow");
+    return w;
+}
+
+#{
+    Liczba bajtów bufora RGBA8 dla obrazu szerokosc x wysokosc albo kod < 0:
+    ROZMIAR_ZLE_WYMIARY, ROZMIAR_POZA_ZAKRESEM, ROZMIAR_PONAD_LIMIT.
+    Każde mnożenie jest poprzedzone dzieleniem, więc samo sprawdzenie nigdy nie przekracza
+    zakresu i64.
+#}
+fun sprawdzRozmiar(szerokosc: i64, wysokosc: i64, limit: i64) -> i64 = {
+    if (szerokosc <= 0 or wysokosc <= 0) return ROZMIAR_ZLE_WYMIARY;
+    if (szerokosc > MAKS_INT / BAJTOW_NA_PIKSEL) return ROZMIAR_POZA_ZAKRESEM;   # krok musi zmieścić się w png_int_32
+    let krok = szerokosc * BAJTOW_NA_PIKSEL;
+    if (wysokosc > MAKS_I64 / krok) return ROZMIAR_POZA_ZAKRESEM;                # iloczyn przekroczyłby i64
+    if (wysokosc > MAKS_INT) return ROZMIAR_POZA_ZAKRESEM;                       # PNG: wysokość najwyżej 2^31 - 1
+    let bajty = wysokosc * krok;
+    if (bajty > limit) return ROZMIAR_PONAD_LIMIT;
+    return bajty;
+}
+
+fun bladRozmiaru(kod: i64, szerokosc: i64, wysokosc: i64, limit: i64) -> Wynik = {
+    if (kod == ROZMIAR_ZLE_WYMIARY) {
+        return blad(BLEDNE_PARAMETRY, f"wymiary {szerokosc}x{wysokosc}: szerokosc i wysokosc musza byc dodatnie".asSlice());
+    }
+    if (kod == ROZMIAR_POZA_ZAKRESEM) {
+        return blad(ZA_DUZY, f"obraz {szerokosc}x{wysokosc} RGBA8 przekracza zakres liczb (krok wiersza do 2147483647 bajtow, wysokosc do 2147483647)".asSlice());
+    }
+    let bajty = szerokosc * BAJTOW_NA_PIKSEL * wysokosc;
+    return blad(ZA_DUZY, f"obraz {szerokosc}x{wysokosc} RGBA8 potrzebuje {bajty} bajtow, limit to {limit}".asSlice());
+}
+
+# Czy bufor obrazu ma dokładnie szerokosc * wysokosc * 4 bajty przy dodatnich wymiarach.
+fun poprawny(o: ref Obraz) -> bool = {
+    let n = sprawdzRozmiar(o.szerokosc, o.wysokosc, MAKS_I64);
+    return n > 0 and n == o.piksele.length();
+}
+
+fun skladowa(wartosc: i64) -> bool = wartosc >= 0 and wartosc <= 255;
+
+# Nowy obraz wypełniony jednym kolorem (składowe 0..255); limit pamięci jak przy wczytywaniu.
+fun nowyObraz(szerokosc: i64, wysokosc: i64, r: i64, g: i64, b: i64, a: i64) -> Wynik = {
+    let n = sprawdzRozmiar(szerokosc, wysokosc, DOMYSLNY_LIMIT);
+    if (n < 0) return bladRozmiaru(n, szerokosc, wysokosc, DOMYSLNY_LIMIT);
+    if (not skladowa(r) or not skladowa(g) or not skladowa(b) or not skladowa(a)) {
+        return blad(BLEDNE_PARAMETRY, f"skladowe koloru ({r}, {g}, {b}, {a}) musza byc w zakresie 0..255".asSlice());
+    }
+    var w: Wynik;
+    w.obraz.szerokosc = szerokosc;
+    w.obraz.wysokosc = wysokosc;
+    w.obraz.piksele.reserve(n);
+    var i: i64 = 0;
+    while (i < n) {
+        w.obraz.piksele.push(r as u8);
+        w.obraz.piksele.push(g as u8);
+        w.obraz.piksele.push(b as u8);
+        w.obraz.piksele.push(a as u8);
+        i += BAJTOW_NA_PIKSEL;
+    }
+    w.ok = true;
+    return w;
+}
+
+fun wObrazie(o: ref Obraz, x: i64, y: i64) -> bool = x >= 0 and y >= 0 and x < o.szerokosc and y < o.wysokosc and poprawny(o);
+
+# Kolor piksela (x, y); poza obrazem: przezroczysta czerń (0, 0, 0, 0).
+fun piksel(o: ref Obraz, x: i64, y: i64) -> Kolor = {
+    var k: Kolor;
+    if (not wObrazie(o, x, y)) return k;
+    let p = (y * o.szerokosc + x) * BAJTOW_NA_PIKSEL;
+    let r: u8 = o.piksele.at(p);
+    let g: u8 = o.piksele.at(p + 1);
+    let b: u8 = o.piksele.at(p + 2);
+    let a: u8 = o.piksele.at(p + 3);
+    k.r = r as i64;
+    k.g = g as i64;
+    k.b = b as i64;
+    k.a = a as i64;
+    return k;
+}
+
+# Ustawia piksel (x, y); false, gdy punkt jest poza obrazem albo składowa poza 0..255.
+fun ustawPiksel(o: ref Obraz, x: i64, y: i64, r: i64, g: i64, b: i64, a: i64) -> bool = {
+    if (not wObrazie(o, x, y)) return false;
+    if (not skladowa(r) or not skladowa(g) or not skladowa(b) or not skladowa(a)) return false;
+    let p = (y * o.szerokosc + x) * BAJTOW_NA_PIKSEL;
+    o.piksele.at(p) = r as u8;
+    o.piksele.at(p + 1) = g as u8;
+    o.piksele.at(p + 2) = b as u8;
+    o.piksele.at(p + 3) = a as u8;
+    return true;
+}
+
+fun naC(s: str) -> String = {
+    var w: String;
+    w.append(s);
+    w.append('\0');
+    return w;
+}
+
+# Nowa, wyzerowana struktura png_image z polem version = PNG_IMAGE_VERSION (wymóg libpng).
+fun nowaStruktura() -> cptr u8 = {
+    let s = clib.malloc(ROZMIAR_STRUKTURY as u64);
+    if (s as u64 == 0u64) return s;
+    let b = s as manyptr u8;
+    var i: i64 = 0;
+    while (i < ROZMIAR_STRUKTURY) {
+        b[i] = 0u8;
+        i += 1;
+    }
+    let p = s as manyptr u32;
+    p[POLE_WERSJA] = PNG_IMAGE_VERSION as u32;
+    return s;
+}
+
+fun pole(s: cptr u8, indeks: i64) -> i64 = {
+    let p = s as manyptr u32;
+    return p[indeks] as i64;
+}
+
+fun ustawPole(s: cptr u8, indeks: i64, wartosc: i64) -> () = {
+    let p = s as manyptr u32;
+    p[indeks] = wartosc as u32;
+}
+
+# Kopia komunikatu z pola message (najwyżej 64 bajty, zakończone zerem).
+fun komunikat(s: cptr u8) -> String = {
+    let b = s as manyptr u8;
+    var w: String;
+    var i: i64 = 0;
+    var dalej = true;
+    while (dalej and i < DLUGOSC_KOMUNIKATU) {
+        let z: u8 = b[BAJT_KOMUNIKATU + i];
+        if (z == 0u8) {
+            dalej = false;
+        } else {
+            w.append(z as char);
+            i += 1;
+        }
+    }
+    if (w.length() == 0) w.append("(libpng nie podala komunikatu)");
+    return w;
+}
+
+# Zwolnienie wewnętrznych zasobów libpng (bezpieczne także po ich zwolnieniu) i samej struktury.
+fun zwolnijStrukture(s: cptr u8) -> () = {
+    png_image_free(s);
+    clib.free(s);
+}
+
+fun plikIstnieje(sciezka: str) -> bool = {
+    let nazwa = naC(sciezka);
+    let plik = fopen(builtins.ptr_from_slice[char](nazwa.asSlice()) as cptr char, builtins.ptr_from_slice[char]("rb\0") as cptr char);
+    if (plik as u64 == 0u64) return false;
+    fclose(plik);
+    return true;
+}
+
+fun przydziel(rozmiar: i64) -> cptr u8 = {
+    var n = rozmiar;
+    if (n < 1) n = 1;
+    return clib.malloc(n as u64);
+}
+
+fun zBufora(bufor: cptr u8, ile: i64) -> List[u8] = {
+    var wynik: List[u8];
+    wynik.reserve(ile);
+    let b = bufor as manyptr u8;
+    var i: i64 = 0;
+    while (i < ile) {
+        wynik.push(b[i]);
+        i += 1;
+    }
+    return wynik;
+}
+
+fun doBufora(dane: ref List[u8], bufor: cptr u8) -> () = {
+    let b = bufor as manyptr u8;
+    var i: i64 = 0;
+    while (i < dane.length()) {
+        b[i] = dane.at(i);
+        i += 1;
+    }
+}
+
+fun wczytaj(sciezka: str) -> Wynik = wczytajZLimitem(sciezka, DOMYSLNY_LIMIT);
+
+#{
+    Wczytanie PNG (dowolny typ: szarość, paleta, RGB, z alpha, 8 lub 16 bitów, z przeplotem)
+    do bufora RGBA8. Kolejność:
+      1. png_image_begin_read_from_file czyta nagłówek: wymiary i format pliku;
+      2. wrapper sprawdza szerokosc * wysokosc * 4 względem zakresu i limitu - dopiero potem
+         przydziela bufor (plik z nagłówkiem 100000 x 100000 nie powoduje przydziału 40 GB);
+      3. png_image_finish_read dekoduje piksele do formatu RGBA;
+      4. wrapper kopiuje piksele do List[u8] i zwalnia bufor oraz strukturę.
+    Plik 16-bitowy bez informacji o gammie traktujemy jak sRGB (flaga PNG_IMAGE_FLAG_16BIT_sRGB):
+    składowa 16-bitowa v daje round(v * 255 / 65535).
+#}
+fun wczytajZLimitem(sciezka: str, limit: i64) -> Wynik = {
+    if (limit < 0) return blad(BLEDNE_PARAMETRY, f"limit pamieci {limit} jest ujemny".asSlice());
+    let s = nowaStruktura();
+    if (s as u64 == 0u64) return blad(BRAK_PAMIECI, "brak pamieci na strukture png_image");
+    let nazwa = naC(sciezka);
+    let poczatek = png_image_begin_read_from_file(s, builtins.ptr_from_slice[char](nazwa.asSlice()) as cptr char);
+    if (poczatek == 0i32) {
+        var odrzucony: Wynik;
+        odrzucony.rodzaj = NIEPOPRAWNY_PNG;
+        if (not plikIstnieje(sciezka)) odrzucony.rodzaj = BRAK_PLIKU;
+        odrzucony.blad.append(f"{sciezka}: ".asSlice());
+        odrzucony.blad.append(komunikat(s).asSlice());
+        zwolnijStrukture(s);
+        return odrzucony;
+    }
+    let szerokosc = pole(s, POLE_SZEROKOSC);
+    let wysokosc = pole(s, POLE_WYSOKOSC);
+    let formatPliku = pole(s, POLE_FORMAT);
+    let n = sprawdzRozmiar(szerokosc, wysokosc, limit);
+    if (n < 0) {
+        var zaDuzy = bladRozmiaru(n, szerokosc, wysokosc, limit);
+        zaDuzy.formatPliku = formatPliku;
+        zwolnijStrukture(s);     # nagłówek był poprawny: libpng ma przydzielone zasoby
+        return zaDuzy;
+    }
+    ustawPole(s, POLE_FORMAT, PNG_FORMAT_RGBA);
+    ustawPole(s, POLE_FLAGI, pole(s, POLE_FLAGI) | PNG_IMAGE_FLAG_16BIT_sRGB);
+    let bufor = przydziel(n);
+    if (bufor as u64 == 0u64) {
+        zwolnijStrukture(s);
+        return blad(BRAK_PAMIECI, f"brak pamieci na {n} bajtow pikseli".asSlice());
+    }
+    let koniec = png_image_finish_read(s, 0u64, bufor, (szerokosc * BAJTOW_NA_PIKSEL) as i32, 0u64);
+    var w: Wynik;
+    w.formatPliku = formatPliku;
+    if (koniec == 0i32) {
+        w.rodzaj = NIEPOPRAWNY_PNG;
+        w.blad.append(f"{sciezka}: ".asSlice());
+        w.blad.append(komunikat(s).asSlice());
+    } else {
+        w.obraz.szerokosc = szerokosc;
+        w.obraz.wysokosc = wysokosc;
+        w.obraz.piksele = zBufora(bufor, n);
+        if ((pole(s, POLE_OSTRZEZENIE_BLAD) & PNG_IMAGE_WARNING) != 0) w.ostrzezenie = komunikat(s);
+        w.ok = true;
+    }
+    clib.free(bufor);
+    zwolnijStrukture(s);
+    return w;
+}
+
+#{
+    Zapis obrazu RGBA8 do pliku PNG (8 bitów, kolor + alpha, bez przeplotu); istniejący plik
+    jest zastępowany. Przed wywołaniem biblioteki wrapper sprawdza wymiary i rozmiar bufora;
+    przy błędzie libpng sama usuwa częściowo zapisany plik.
+#}
+fun zapisz(sciezka: str, o: ref Obraz) -> Wynik = {
+    let n = sprawdzRozmiar(o.szerokosc, o.wysokosc, MAKS_I64);
+    if (n < 0) return bladRozmiaru(n, o.szerokosc, o.wysokosc, MAKS_I64);
+    if (o.piksele.length() != n) {
+        return blad(BLEDNE_PARAMETRY, f"bufor ma {o.piksele.length()} bajtow, a obraz {o.szerokosc}x{o.wysokosc} RGBA8 wymaga {n}".asSlice());
+    }
+    let s = nowaStruktura();
+    if (s as u64 == 0u64) return blad(BRAK_PAMIECI, "brak pamieci na strukture png_image");
+    ustawPole(s, POLE_SZEROKOSC, o.szerokosc);
+    ustawPole(s, POLE_WYSOKOSC, o.wysokosc);
+    ustawPole(s, POLE_FORMAT, PNG_FORMAT_RGBA);
+    let bufor = przydziel(n);
+    if (bufor as u64 == 0u64) {
+        zwolnijStrukture(s);
+        return blad(BRAK_PAMIECI, f"brak pamieci na {n} bajtow pikseli".asSlice());
+    }
+    doBufora(&o.piksele, bufor);
+    let nazwa = naC(sciezka);
+    let wynik = png_image_write_to_file(s, builtins.ptr_from_slice[char](nazwa.asSlice()) as cptr char, 0i32,
+                                        bufor, (o.szerokosc * BAJTOW_NA_PIKSEL) as i32, 0u64);
+    var w: Wynik;
+    if (wynik == 0i32) {
+        w.rodzaj = BLAD_ZAPISU;
+        w.blad.append(f"nie zapisano {sciezka}: ".asSlice());
+        w.blad.append(komunikat(s).asSlice());
+    } else {
+        if ((pole(s, POLE_OSTRZEZENIE_BLAD) & PNG_IMAGE_WARNING) != 0) w.ostrzezenie = komunikat(s);
+        w.ok = true;
+    }
+    clib.free(bufor);
+    zwolnijStrukture(s);
+    return w;
+}
