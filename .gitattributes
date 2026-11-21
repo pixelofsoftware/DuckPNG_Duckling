@@ -1,0 +1,4 @@
+# Duckling (.dk) nie jest jeszcze znany GitHub Linguist, więc pasek języków go nie pokazuje.
+# Skrypty pomocnicze (budowanie, uruchamianie, narzędzia) nie wliczają się do statystyk języków.
+*.py linguist-vendored
+*.sh linguist-vendored

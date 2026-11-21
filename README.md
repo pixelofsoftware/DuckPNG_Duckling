@@ -1,5 +1,7 @@
 # DuckPNG: wrapper libpng dla Ducklinga
 
+![Napisane w Duckling](https://img.shields.io/badge/napisane%20w-Duckling-f2c94c)
+
 Zespół: Pixel of Software (Marcin Kowalczyk). Temat: P02 DuckBridge, biblioteka libpng (poziom 3). Skład: 1 osoba.
 
 Moduł `png` (`app/png.dk`) wczytuje i zapisuje obrazy PNG przez uproszczone API libpng (`png_image`). Każdy obsługiwany PNG trafia do jednego publicznego typu `Obraz` z buforem RGBA8. Dotyczy to szarości, palety, RGB, plików z alpha, 16-bitowych i z przeplotem. Zapis tworzy PNG 8-bitowy z kolorem i alpha.
